@@ -1,0 +1,108 @@
+// AiDisco Engine — scrape-only schema.
+//
+// Design note: there are deliberately NO scoring columns here. `raw_response` is
+// the source of truth. Scoring is a pure function applied over stored text later,
+// which means weights can change without re-scraping a single prompt.
+//
+// Status/platform columns are TEXT rather than Prisma enums on purpose: the job
+// queue is raw SQL (FOR UPDATE SKIP LOCKED) and enum casts make it noisy. Safety
+// is enforced at the app layer via the union types in src/types.ts.
+
+generator client {
+  provider = "prisma-client-js"
+  // Explicit output. Without this, Prisma resolves the output dir relative to
+  // this schema (the repo root) and generates into a second, stray node_modules
+  // that the worker's imports never see.
+  output   = "../worker/src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Run {
+  id               String    @id @default(uuid()) @db.Uuid
+  name             String
+  clientName       String    @map("client_name")
+  status           String    @default("pending") // pending | running | completed | failed
+  totalPrompts     Int       @default(0) @map("total_prompts")
+  completedPrompts Int       @default(0) @map("completed_prompts")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  completedAt      DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  prompts Prompt[]
+  results Result[]
+  jobs    Job[]
+
+  @@index([status, createdAt])
+  @@map("runs")
+}
+
+model Prompt {
+  id           String   @id @default(uuid()) @db.Uuid
+  runId        String   @map("run_id") @db.Uuid
+  text         String
+  category     String?  // branded | unbranded | comparison
+  funnelStage  String?  @map("funnel_stage") // awareness | consideration | decision
+  searchVolume Int?     @map("search_volume")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  run     Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  results Result[]
+  jobs    Job[]
+
+  @@index([runId])
+  @@map("prompts")
+}
+
+// One row per prompt x platform x sample. Raw scrape output only.
+model Result {
+  id           String    @id @default(uuid()) @db.Uuid
+  runId        String    @map("run_id") @db.Uuid
+  promptId     String    @map("prompt_id") @db.Uuid
+  platform     String // chatgpt | gemini | claude
+  // sampleIndex exists because one scrape is a sample, not a measurement — the
+  // same prompt returns different answers run to run. Defaults to 0 (N=1); raise
+  // SAMPLES_PER_PROMPT later without a migration.
+  sampleIndex  Int       @default(0) @map("sample_index")
+  rawResponse  String?   @map("raw_response")
+  modelVersion String?   @map("model_version") // as reported by the UI at scrape time
+  workerId     String?   @map("worker_id")
+  status       String    @default("pending") // pending | completed | failed
+  errorMessage String?   @map("error_message")
+  scrapedAt    DateTime? @map("scraped_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  run    Run    @relation(fields: [runId], references: [id], onDelete: Cascade)
+  prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, promptId, platform, sampleIndex])
+  @@index([runId, status])
+  @@map("results")
+}
+
+model Job {
+  id          String    @id @default(uuid()) @db.Uuid
+  runId       String    @map("run_id") @db.Uuid
+  promptId    String    @map("prompt_id") @db.Uuid
+  platform    String
+  sampleIndex Int       @default(0) @map("sample_index")
+  status      String    @default("queued") // queued | claimed | completed | failed
+  workerId    String?   @map("worker_id")
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3) @map("max_attempts")
+  lastError   String?   @map("last_error")
+  claimedAt   DateTime? @map("claimed_at") @db.Timestamptz(6)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  run    Run    @relation(fields: [runId], references: [id], onDelete: Cascade)
+  prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  // The claim query's covering index. Without this the queue table-scans once
+  // there are a few thousand completed jobs sitting in it.
+  @@index([status, createdAt])
+  @@index([runId])
+  @@map("jobs")
+}

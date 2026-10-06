@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+
+# Playwright persistent browser profiles — contain live session cookies.
+# NEVER commit these.
+profiles/
+
+# Generated Prisma client
+worker/src/generated/
