@@ -14,6 +14,9 @@
     "build": "tsc",
     "login": "tsx src/login.ts",
     "seed": "tsx src/seed.ts",
+    "smoke": "tsx src/smoke.ts",
+    "ipcheck": "tsx src/ipcheck.ts",
+    "cleanup": "tsx src/cleanup.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

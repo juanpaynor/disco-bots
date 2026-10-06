@@ -11,8 +11,12 @@ import type { Platform } from "./types.js";
 export async function launchContext(platform: Platform): Promise<BrowserContext> {
   const userDataDir = path.join(config.profileDir, platform);
 
+  const proxy = config.proxyFor(platform);
+  if (proxy) console.log(`[${platform}] routing via proxy ${proxy.server}`);
+
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: config.headless,
+    ...(proxy ? { proxy } : {}),
     viewport: { width: 1440, height: 900 },
     locale: "en-US",
     timezoneId: "Asia/Manila",
