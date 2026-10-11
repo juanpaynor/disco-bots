@@ -1,0 +1,14 @@
+#!/bin/sh
+# Resolve the real launcher even when invoked through ~/.local/bin/disco.
+launcher="$0"
+while [ -L "$launcher" ]; do
+  target=$(readlink "$launcher")
+  case "$target" in
+    /*) launcher="$target" ;;
+    *) launcher="$(dirname "$launcher")/$target" ;;
+  esac
+done
+project_dir=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd) || exit 1
+export DISCO_INPUT_CWD="$PWD"
+cd "$project_dir/worker" || exit 1
+exec node --import tsx src/disco.ts "$@"

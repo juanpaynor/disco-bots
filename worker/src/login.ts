@@ -10,39 +10,44 @@
  * instructions on the account. A personalised account answers differently from a
  * clean one, which quietly makes your audit unreproducible.
  */
-import { chromium } from "playwright";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { config } from "./config.js";
+import { launchContext } from "./browser.js";
 import { isPlatform } from "./types.js";
 
-const URLS = {
+const URLS: Record<string, string> = {
   chatgpt: "https://chatgpt.com/",
   gemini: "https://gemini.google.com/app",
   claude: "https://claude.ai/login",
+  // Google Search needs no login, but a warmed profile (consent dialogs
+  // dismissed, region settled) still behaves more like a real user.
+  google: "https://www.google.com/",
 };
 
 const platform = process.argv[2];
 if (!platform || !isPlatform(platform)) {
-  console.error("usage: npm run login -- <chatgpt|gemini|claude>");
+  console.error("usage: npm run login -- <chatgpt|gemini|claude|google>");
   process.exit(1);
 }
 
 const userDataDir = path.join(config.profileDir, platform);
 console.log(`Opening ${platform}. Profile: ${userDataDir}`);
 
-const context = await chromium.launchPersistentContext(userDataDir, {
-  headless: false, // always headed — you need to actually type a password
-  viewport: { width: 1440, height: 900 },
-  args: ["--disable-blink-features=AutomationControlled"],
-});
-
-const page = context.pages()[0] ?? (await context.newPage());
-await page.goto(URLS[platform]);
-
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-await rl.question("\nSign in, disable memory/custom instructions, then press Enter here…");
-rl.close();
-
-await context.close();
-console.log(`Saved. ${platform} profile is ready.`);
+// The login must use the same channel, proxy, locale and remote session as jobs.
+// Follow the real window dimensions so account controls stay on screen when
+// the user resizes the browser on a smaller display.
+const context = await launchContext(platform, { headless: false, viewport: null });
+try {
+  const page = context.pages()[0] ?? (await context.newPage());
+  await page.goto(URLS[platform]);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    await rl.question("\nSign in, disable memory/custom instructions, then press Enter here…");
+  } finally {
+    rl.close();
+  }
+} finally {
+  await context.close();
+}
+console.log(`Session saved. Run a verification before queueing ${platform} jobs.`);

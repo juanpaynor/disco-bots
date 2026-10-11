@@ -25,8 +25,16 @@ async function contextFor(platform: Platform): Promise<BrowserContext> {
   return ctx;
 }
 
+let consecutiveFailures = 0;
+let promptsThisSession = 0;
+
 async function runLoop(loopId: number): Promise<void> {
   while (!shuttingDown) {
+    if (config.sessionBudget > 0 && promptsThisSession >= config.sessionBudget) {
+      console.log(`[loop ${loopId}] session budget reached (${config.sessionBudget}) — stopping cleanly`);
+      shuttingDown = true;
+      break;
+    }
     let job;
     try {
       job = await claimJob(config.workerId);
@@ -56,14 +64,27 @@ async function runLoop(loopId: number): Promise<void> {
       if (!output.text.trim()) throw new Error("empty response");
 
       await completeJob(job, output, config.workerId);
-      console.log(`[loop ${loopId}] done ${job.id} — ${output.text.length} chars`);
+      consecutiveFailures = 0;
+      promptsThisSession += 1;
+      console.log(`[loop ${loopId}] done ${job.id} — ${output.text.length} chars (${promptsThisSession}/${config.sessionBudget || "∞"} this session)`);
     } catch (err) {
       console.error(`[loop ${loopId}] failed ${job.id}:`, err instanceof Error ? err.message : err);
       await failJob(job, err);
+      promptsThisSession += 1;
+      consecutiveFailures += 1;
+
+      if (consecutiveFailures >= config.maxConsecutiveFailures) {
+        console.error(
+          `[loop ${loopId}] CIRCUIT BREAKER — ${consecutiveFailures} consecutive failures. ` +
+          `Stopping rather than retrying into whatever is refusing us.`
+        );
+        shuttingDown = true;
+        break;
+      }
     }
 
     // Never fire prompts back-to-back at a fixed cadence.
-    await jitter(2000, 5000);
+    await jitter(config.gapMinMs, config.gapMaxMs);
   }
   console.log(`[loop ${loopId}] stopped`);
 }

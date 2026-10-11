@@ -1,6 +1,6 @@
 # Build from the REPO ROOT so prisma/ is in context:
 #   docker build -f worker/Dockerfile -t aidisco-worker .
-FROM mcr.microsoft.com/playwright:v1.48.2-jammy
+FROM mcr.microsoft.com/playwright:v1.63.0-noble
 
 WORKDIR /app
 

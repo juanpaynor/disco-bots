@@ -7,6 +7,9 @@
     "schema": "../prisma/schema.prisma"
   },
   "scripts": {
+    "disco": "node --import tsx src/disco.ts",
+    "test:disco": "node --import tsx --test src/local-run.test.ts src/disco-wizard.test.ts",
+    "test:chatgpt": "node --import tsx --test src/bots/chatgpt.test.ts",
     "generate": "prisma generate",
     "db:push": "prisma db push",
     "dev": "tsx watch src/index.ts",
@@ -15,14 +18,19 @@
     "login": "tsx src/login.ts",
     "seed": "tsx src/seed.ts",
     "smoke": "tsx src/smoke.ts",
+    "verify:claude": "tsx src/verify-claude.ts",
+    "test:claude": "tsx --test src/bots/claude.test.ts",
     "ipcheck": "tsx src/ipcheck.ts",
     "cleanup": "tsx src/cleanup.ts",
+    "inspect": "tsx src/inspect.ts",
+    "export": "tsx src/export.ts",
+    "dash": "tsx src/dash.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
     "dotenv": "^16.4.5",
-    "playwright": "^1.48.2"
+    "playwright": "1.63.0"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

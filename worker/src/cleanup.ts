@@ -1,7 +1,7 @@
-// Delete a run and everything hanging off it (prompts, jobs, results cascade).
+// Delete an audit and everything hanging off it (prompts, jobs, results cascade).
 import { prisma } from "./db.js";
-const runId = process.argv[2];
-if (!runId) { console.error("usage: npm run cleanup -- <runId>"); process.exit(1); }
-const run = await prisma.run.delete({ where: { id: runId } });
-console.log(`deleted run "${run.name}" (${run.id})`);
+const auditId = process.argv[2];
+if (!auditId) { console.error("usage: npm run cleanup -- <auditId>"); process.exit(1); }
+const audit = await prisma.audit.delete({ where: { id: auditId } });
+console.log(`deleted audit "${audit.name}" (${audit.id})`);
 await prisma.$disconnect();

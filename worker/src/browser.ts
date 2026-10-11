@@ -8,18 +8,47 @@ import type { Platform } from "./types.js";
  * so a login survives both process restarts and Railway deploys — provided
  * PROFILE_DIR points at a mounted volume in production.
  */
-export async function launchContext(platform: Platform): Promise<BrowserContext> {
-  const userDataDir = path.join(config.profileDir, platform);
+export async function launchContext(
+  platform: Platform,
+  options: { headless?: boolean; viewport?: { width: number; height: number } | null } = {}
+): Promise<BrowserContext> {
+  // --- Hosted browser path -------------------------------------------------
+  // When BROWSER_CDP_URL is set we do not run a browser at all: we attach to one
+  // running at a provider (Browserbase, Steel, Browserless, or any Chrome started
+  // with --remote-debugging-port). That provider owns stealth, proxies and the
+  // display, so xvfb and the proxy config below are all bypassed.
+  //
+  // Session persistence is the provider's job here, NOT the local profile dir.
+  // Each provider keeps logins in its own construct (Browserbase "contexts",
+  // Steel sessions); pass that id through the URL so the same account comes back.
+  const cdpUrl = config.cdpUrlFor(platform);
+  if (cdpUrl) {
+    console.log(`[${platform}] attaching to hosted browser`);
+    const browser = await chromium.connectOverCDP(cdpUrl);
+    const ctx = browser.contexts()[0];
+    if (!ctx) throw new Error(`${platform}: hosted browser returned no context`);
+    return ctx;
+  }
 
+  // --- Local browser path --------------------------------------------------
+  const userDataDir = path.join(config.profileDir, platform);
   const proxy = config.proxyFor(platform);
   if (proxy) console.log(`[${platform}] routing via proxy ${proxy.server}`);
 
   const context = await chromium.launchPersistentContext(userDataDir, {
-    headless: config.headless,
+    headless: options.headless ?? config.headless,
+    ...(config.browserChannel ? { channel: config.browserChannel } : {}),
     ...(proxy ? { proxy } : {}),
-    viewport: { width: 1440, height: 900 },
-    locale: "en-US",
-    timezoneId: "Asia/Manila",
+    viewport: options.viewport === undefined ? { width: 1440, height: 900 } : options.viewport,
+    // Geo-neutral by default: the prompt sheet specifies "Neutral (no location
+    // set)", so the browser must not volunteer a locale or timezone that skews
+    // answers. UTC and en-US are the neutral baseline.
+    locale: config.locale,
+    timezoneId: config.timezone,
+    // Grant NO permissions. An empty list means a site asking for precise
+    // location is denied rather than prompted — a prompt left hanging can block
+    // the page, and a grant would defeat the neutral market condition outright.
+    permissions: [],
     args: [
       "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
@@ -28,8 +57,10 @@ export async function launchContext(platform: Platform): Promise<BrowserContext>
   });
 
   // navigator.webdriver is the single most-checked automation tell.
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  // Keep this as browser-native source: tsx can inject a Node-only __name
+  // helper into nested functions when serializing an init-script callback.
+  await context.addInitScript({ content:
+    'Object.defineProperty(navigator, "webdriver", { get: () => undefined });'
   });
 
   return context;

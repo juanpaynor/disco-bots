@@ -1,7 +1,7 @@
 import { Prisma } from "./generated/prisma/index.js";
 import { prisma } from "./db.js";
 import { config } from "./config.js";
-import type { ClaimedJob, Platform } from "./types.js";
+import type { ClaimedJob, Platform, ScrapeOutput } from "./types.js";
 
 /**
  * Atomically claim one queued job.
@@ -15,12 +15,18 @@ import type { ClaimedJob, Platform } from "./types.js";
  * inside that subquery, so the row is reserved before we write to it.
  */
 export async function claimJob(workerId: string): Promise<ClaimedJob | null> {
+  // Empty list means "any platform"; otherwise restrict the claim.
+  const platformFilter = config.platforms.length
+    ? Prisma.sql`AND platform = ANY(${config.platforms})`
+    : Prisma.empty;
+
   const rows = await prisma.$queryRaw<Array<{
     id: string;
-    run_id: string;
+    audit_id: string;
     prompt_id: string;
+    result_id: string;
     platform: string;
-    sample_index: number;
+    run_number: number;
     attempts: number;
     max_attempts: number;
     prompt_text: string;
@@ -35,13 +41,22 @@ export async function claimJob(workerId: string): Promise<ClaimedJob | null> {
         SELECT id FROM jobs
         WHERE status = 'queued'
           AND attempts < max_attempts
-        ORDER BY created_at
+          ${platformFilter}
+        -- run_number FIRST, then creation order.
+        --
+        -- Gary's sheet asks each prompt twice per surface. Draining them in
+        -- insert order means asking the identical question twice ~45s apart,
+        -- which is both the loudest bot signal in the whole run and poor
+        -- sampling: two hits on the same session state measure nothing. Taking
+        -- every run 1 before any run 2 puts repeats an entire pass apart, so
+        -- the x2 captures real variance instead of an echo.
+        ORDER BY run_number, created_at
         FOR UPDATE SKIP LOCKED
         LIMIT 1
       )
-      RETURNING id, run_id, prompt_id, platform, sample_index, attempts, max_attempts
+      RETURNING id, audit_id, prompt_id, result_id, platform, run_number, attempts, max_attempts
     )
-    SELECT c.id, c.run_id, c.prompt_id, c.platform, c.sample_index,
+    SELECT c.id, c.audit_id, c.prompt_id, c.result_id, c.platform, c.run_number,
            c.attempts, c.max_attempts, p.text AS prompt_text
     FROM claimed c
     JOIN prompts p ON p.id = c.prompt_id
@@ -52,10 +67,11 @@ export async function claimJob(workerId: string): Promise<ClaimedJob | null> {
 
   return {
     id: row.id,
-    runId: row.run_id,
+    auditId: row.audit_id,
     promptId: row.prompt_id,
+    resultId: row.result_id,
     platform: row.platform as Platform,
-    sampleIndex: row.sample_index,
+    runNumber: row.run_number,
     attempts: row.attempts,
     maxAttempts: row.max_attempts,
     promptText: row.prompt_text,
@@ -67,11 +83,11 @@ export async function claimJob(workerId: string): Promise<ClaimedJob | null> {
  *
  * A worker that crashes (or gets OOM-killed, which Playwright makes likely)
  * leaves its job stuck in 'claimed' forever. Nothing else will ever pick it up,
- * so without this a run silently never finishes. Jobs that have burned all their
- * attempts go to 'failed' instead of looping.
+ * so without this an audit silently never finishes. Jobs that have burned all
+ * their attempts go to 'failed' instead of looping.
  */
 export async function reclaimStaleJobs(): Promise<number> {
-  const result = await prisma.$executeRaw(Prisma.sql`
+  return prisma.$executeRaw(Prisma.sql`
     UPDATE jobs
     SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
         worker_id = NULL,
@@ -79,39 +95,35 @@ export async function reclaimStaleJobs(): Promise<number> {
     WHERE status = 'claimed'
       AND claimed_at < NOW() - make_interval(secs => ${config.staleJobSeconds}::int)
   `);
-  return result;
 }
 
-/** Record a successful scrape and close out the job, in one transaction. */
+/**
+ * Fill the grid row and close out the job, in one transaction.
+ *
+ * Extraction fields are deliberately left null here. Scrape and extract are
+ * separate passes so extraction can be re-run over stored text — changing how
+ * "recommended" is judged must never require re-scraping 280 pages.
+ */
 export async function completeJob(
   job: ClaimedJob,
-  output: { text: string; modelVersion: string | null },
+  output: ScrapeOutput,
   workerId: string
 ): Promise<void> {
   await prisma.$transaction([
-    prisma.result.upsert({
-      where: {
-        runId_promptId_platform_sampleIndex: {
-          runId: job.runId,
-          promptId: job.promptId,
-          platform: job.platform,
-          sampleIndex: job.sampleIndex,
-        },
-      },
-      create: {
-        runId: job.runId,
-        promptId: job.promptId,
-        platform: job.platform,
-        sampleIndex: job.sampleIndex,
+    prisma.result.update({
+      where: { id: job.resultId },
+      data: {
         rawResponse: output.text,
         modelVersion: output.modelVersion,
-        workerId,
-        status: "completed",
-        scrapedAt: new Date(),
-      },
-      update: {
-        rawResponse: output.text,
-        modelVersion: output.modelVersion,
+        resultUrl: output.resultUrl ?? null,
+        screenshotPath: output.screenshotPath ?? null,
+        freshSearch: true, // every scrape opens a new conversation
+        ...(output.aiOverviewPresent !== undefined
+          ? { aiOverviewPresent: output.aiOverviewPresent }
+          : {}),
+        ...(output.brandOrganicRank !== undefined
+          ? { brandOrganicRank: output.brandOrganicRank }
+          : {}),
         workerId,
         status: "completed",
         errorMessage: null,
@@ -122,18 +134,18 @@ export async function completeJob(
       where: { id: job.id },
       data: { status: "completed", completedAt: new Date(), lastError: null },
     }),
-    prisma.run.update({
-      where: { id: job.runId },
-      data: { completedPrompts: { increment: 1 } },
+    prisma.audit.update({
+      where: { id: job.auditId },
+      data: { completedRuns: { increment: 1 } },
     }),
   ]);
 
-  await closeRunIfDone(job.runId);
+  await closeAuditIfDone(job.auditId);
 }
 
 /** Requeue a failed job, or bury it once it's out of attempts. */
 export async function failJob(job: ClaimedJob, error: unknown): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = (error instanceof Error ? error.message : String(error)).slice(0, 2000);
   const exhausted = job.attempts >= job.maxAttempts;
 
   await prisma.job.update({
@@ -141,48 +153,30 @@ export async function failJob(job: ClaimedJob, error: unknown): Promise<void> {
     data: {
       status: exhausted ? "failed" : "queued",
       workerId: null,
-      lastError: message.slice(0, 2000),
+      lastError: message,
       ...(exhausted ? { completedAt: new Date() } : {}),
     },
   });
 
   if (exhausted) {
-    await prisma.result.upsert({
-      where: {
-        runId_promptId_platform_sampleIndex: {
-          runId: job.runId,
-          promptId: job.promptId,
-          platform: job.platform,
-          sampleIndex: job.sampleIndex,
-        },
-      },
-      create: {
-        runId: job.runId,
-        promptId: job.promptId,
-        platform: job.platform,
-        sampleIndex: job.sampleIndex,
-        status: "failed",
-        errorMessage: message.slice(0, 2000),
-      },
-      update: { status: "failed", errorMessage: message.slice(0, 2000) },
+    await prisma.result.update({
+      where: { id: job.resultId },
+      data: { status: "failed", errorMessage: message },
     });
-    await closeRunIfDone(job.runId);
+    await closeAuditIfDone(job.auditId);
   }
 }
 
-/** Mark the run finished once no job in it is still outstanding. */
-async function closeRunIfDone(runId: string): Promise<void> {
+/** Mark the audit finished once no job in it is still outstanding. */
+async function closeAuditIfDone(auditId: string): Promise<void> {
   const outstanding = await prisma.job.count({
-    where: { runId, status: { in: ["queued", "claimed"] } },
+    where: { auditId, status: { in: ["queued", "claimed"] } },
   });
   if (outstanding > 0) return;
 
-  const failed = await prisma.job.count({ where: { runId, status: "failed" } });
-  await prisma.run.update({
-    where: { id: runId },
-    data: {
-      status: failed > 0 ? "failed" : "completed",
-      completedAt: new Date(),
-    },
+  const failed = await prisma.job.count({ where: { auditId, status: "failed" } });
+  await prisma.audit.update({
+    where: { id: auditId },
+    data: { status: failed > 0 ? "failed" : "completed", completedAt: new Date() },
   });
 }

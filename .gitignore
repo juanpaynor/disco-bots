@@ -8,5 +8,11 @@ dist/
 # NEVER commit these.
 profiles/
 
+# Browser evidence includes private conversation text and screenshots.
+captures/
+
+# Local AiDisco run state and responses.
+worker/exports/disco/
+
 # Generated Prisma client
 worker/src/generated/

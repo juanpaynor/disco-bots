@@ -1,8 +1,13 @@
-// AiDisco Engine — scrape-only schema.
+// AiDisco Engine — schema modelled on Gary's actual output workbook.
 //
-// Design note: there are deliberately NO scoring columns here. `raw_response` is
-// the source of truth. Scoring is a pure function applied over stored text later,
-// which means weights can change without re-scraping a single prompt.
+// Naming note: Gary's sheet uses "Run" twice — "Run ID" (BL-0001) identifies a
+// single grid ROW, and "Run #" (1 or 2) is which repeat of a surface it is. To
+// keep that unambiguous, the whole audit is an `Audit` here, and `Result` is one
+// Run Grid row. Nothing in this schema is called just "run".
+//
+// Sheet 1 (Prompts & Conditions) -> Prompt
+// Sheet 2 (Run Grid)             -> Result   <- the thing the bot produces
+// Sheet 3 (Standings)            -> derived, a GROUP BY over Result. Not stored.
 //
 // Status/platform columns are TEXT rather than Prisma enums on purpose: the job
 // queue is raw SQL (FOR UPDATE SKIP LOCKED) and enum casts make it noisy. Safety
@@ -21,73 +26,169 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Run {
-  id               String    @id @default(uuid()) @db.Uuid
-  name             String
-  clientName       String    @map("client_name")
-  status           String    @default("pending") // pending | running | completed | failed
-  totalPrompts     Int       @default(0) @map("total_prompts")
-  completedPrompts Int       @default(0) @map("completed_prompts")
-  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  completedAt      DateTime? @map("completed_at") @db.Timestamptz(6)
+/// The brand being audited, plus everything needed to recognise it in prose.
+///
+/// Bangtao spans two properties (bangtaofightstore.com for KPI 1,
+/// bangtaomuaythai.com for KPI 2), so domains and aliases are lists. Alias
+/// matching is what makes "Bangtao mentioned?" answerable deterministically
+/// instead of asking a model to guess.
+model Client {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String // "Bangtao"
+  domains   String[] // bangtaofightstore.com, bangtaomuaythai.com
+  aliases   String[] // "Bangtao", "Bangtao Fight Store", "Bangtao Muay Thai"
+  /// Known competitor names, so the competitor column is a lookup rather than a
+  /// judgement call. Fairtex, YOKKAO, Twins Special, Top King, Raja, Venum…
+  rivals    String[]
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
+  audits Audit[]
+
+  @@map("clients")
+}
+
+/// One execution of a prompt sheet against the platforms.
+model Audit {
+  id       String @id @default(uuid()) @db.Uuid
+  name     String
+  clientId String @map("client_id") @db.Uuid
+
+  /// Prefix for Run IDs in the grid — "BL" yields BL-0001, BL-0002…
+  runIdPrefix String @default("RUN") @map("run_id_prefix")
+
+  status       String    @default("pending") // pending | running | completed | failed
+  totalRuns    Int       @default(0) @map("total_runs")
+  completedRuns Int      @default(0) @map("completed_runs")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  completedAt  DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  client  Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
   prompts Prompt[]
   results Result[]
   jobs    Job[]
 
   @@index([status, createdAt])
-  @@map("runs")
+  @@map("audits")
 }
 
+/// Sheet 1 row: a prompt and the conditions it must be asked under.
 model Prompt {
-  id           String   @id @default(uuid()) @db.Uuid
-  runId        String   @map("run_id") @db.Uuid
-  text         String
-  category     String?  // branded | unbranded | comparison
-  funnelStage  String?  @map("funnel_stage") // awareness | consideration | decision
-  searchVolume Int?     @map("search_volume")
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  id      String @id @default(uuid()) @db.Uuid
+  auditId String @map("audit_id") @db.Uuid
 
-  run     Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  /// Gary's stable ID (PROMPT-0001). This is what makes cross-audit comparison
+  /// possible — without it you cannot say a prompt moved from absent to named.
+  externalId String @map("external_id")
+
+  rank        Int
+  kpiPriority String @map("kpi_priority") // "1 - Fightstore" | "2 - Camp"
+  text        String // asked verbatim
+  theme       String?
+  cluster     String?
+
+  /// Volume is a band in the source sheet ("High: ~100-300/mo"), not a number.
+  /// Stored verbatim, with a parsed midpoint alongside for sorting/weighting.
+  volumeBand      String? @map("volume_band")
+  volumeMidpoint  Int?    @map("volume_midpoint")
+  rankingRationale String? @map("ranking_rationale")
+
+  framing         String  @default("Brand-blind") @map("framing") // Brand-blind | Brand-aware | Competitor-aware
+  marketCondition String  @default("Neutral") @map("market_condition")
+  locale          String  @default("en")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  audit   Audit    @relation(fields: [auditId], references: [id], onDelete: Cascade)
   results Result[]
   jobs    Job[]
 
-  @@index([runId])
+  @@unique([auditId, externalId])
+  @@index([auditId, rank])
   @@map("prompts")
 }
 
-// One row per prompt x platform x sample. Raw scrape output only.
+/// Sheet 2 row — one cell of the Run Grid. 40 prompts x 7 surfaces = 280 of these.
+///
+/// Rows are created up front in `pending` state so the grid exists in full from
+/// the start, exactly as Gary's sheet looks when partly filled. The worker fills
+/// them in place rather than inserting as it goes.
 model Result {
-  id           String    @id @default(uuid()) @db.Uuid
-  runId        String    @map("run_id") @db.Uuid
-  promptId     String    @map("prompt_id") @db.Uuid
-  platform     String // chatgpt | gemini | claude
-  // sampleIndex exists because one scrape is a sample, not a measurement — the
-  // same prompt returns different answers run to run. Defaults to 0 (N=1); raise
-  // SAMPLES_PER_PROMPT later without a migration.
-  sampleIndex  Int       @default(0) @map("sample_index")
-  rawResponse  String?   @map("raw_response")
-  modelVersion String?   @map("model_version") // as reported by the UI at scrape time
-  workerId     String?   @map("worker_id")
+  id      String @id @default(uuid()) @db.Uuid
+  auditId String @map("audit_id") @db.Uuid
+  promptId String @map("prompt_id") @db.Uuid
+
+  /// "BL-0001" — the grid's own Run ID column.
+  runLabel  String @map("run_label")
+  platform  String // chatgpt | gemini | claude | google
+  runNumber Int    @map("run_number") // 1 or 2 — Gary's "Run #"
+
+  // --- capture -------------------------------------------------------------
+  rawResponse String? @map("raw_response")
+  /// "Model / result page" — the conversation or SERP URL, as proof.
+  resultUrl   String? @map("result_url")
+  /// Path to a full-page screenshot. More durable proof than a share link,
+  /// which can be revoked or expire.
+  screenshotPath String? @map("screenshot_path")
+  /// Always true for us: every scrape opens a fresh chat. Recorded rather than
+  /// assumed so the claim is auditable.
+  freshSearch Boolean? @map("fresh_search")
+  modelVersion String? @map("model_version")
+
+  // --- extraction ----------------------------------------------------------
+  // Null until extraction runs. Scrape and extract are separate passes so
+  // extraction can be re-run over stored text without re-scraping.
+  brandMentioned   Boolean? @map("brand_mentioned")
+  /// WHICH of the client's identities matched, not just whether one did.
+  ///
+  /// Bangtao is two properties — bangtaofightstore.com (KPI 1) and
+  /// bangtaomuaythai.com (KPI 2). Gary's grid has one "Bangtao mentioned?"
+  /// column, so the headline answer is "either". Recording the specific match
+  /// costs one array and means the sharper question ("did the STORE get named
+  /// on a store prompt?") is answerable later without re-extracting anything.
+  matchedAliases   String[] @map("matched_aliases")
+  matchedDomains   String[] @map("matched_domains")
+  brandRecommended Boolean? @map("brand_recommended")
+  /// Position in the recommendation list, 1-indexed. Null when not recommended.
+  recommendationPosition Int? @map("recommendation_position")
+  /// Every business named, IN THE ORDER THE ANSWER NAMES THEM. Order is the
+  /// whole point — being 1st and being 6th are different products.
+  businessesNamed  String[] @map("businesses_named")
+  competitorsNamed String[] @map("competitors_named")
+  citedSources     String[] @map("cited_sources")
+
+  // --- Google Search only --------------------------------------------------
+  aiOverviewPresent Boolean? @map("ai_overview_present")
+  brandInAiOverview Boolean? @map("brand_in_ai_overview")
+  brandOrganicRank  Int?     @map("brand_organic_rank")
+
+  // --- bookkeeping ---------------------------------------------------------
   status       String    @default("pending") // pending | completed | failed
   errorMessage String?   @map("error_message")
+  workerId     String?   @map("worker_id")
   scrapedAt    DateTime? @map("scraped_at") @db.Timestamptz(6)
+  extractedAt  DateTime? @map("extracted_at") @db.Timestamptz(6)
   createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  run    Run    @relation(fields: [runId], references: [id], onDelete: Cascade)
+  audit  Audit  @relation(fields: [auditId], references: [id], onDelete: Cascade)
   prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  job    Job?
 
-  @@unique([runId, promptId, platform, sampleIndex])
-  @@index([runId, status])
+  @@unique([auditId, promptId, platform, runNumber])
+  @@unique([auditId, runLabel])
+  @@index([auditId, status])
   @@map("results")
 }
 
 model Job {
-  id          String    @id @default(uuid()) @db.Uuid
-  runId       String    @map("run_id") @db.Uuid
-  promptId    String    @map("prompt_id") @db.Uuid
-  platform    String
-  sampleIndex Int       @default(0) @map("sample_index")
+  id       String @id @default(uuid()) @db.Uuid
+  auditId  String @map("audit_id") @db.Uuid
+  promptId String @map("prompt_id") @db.Uuid
+  /// The grid row this job fills. One-to-one: a job exists to populate a Result.
+  resultId String @unique @map("result_id") @db.Uuid
+
+  platform  String
+  runNumber Int    @map("run_number")
+
   status      String    @default("queued") // queued | claimed | completed | failed
   workerId    String?   @map("worker_id")
   attempts    Int       @default(0)
@@ -97,12 +198,13 @@ model Job {
   completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  run    Run    @relation(fields: [runId], references: [id], onDelete: Cascade)
+  audit  Audit  @relation(fields: [auditId], references: [id], onDelete: Cascade)
   prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  result Result @relation(fields: [resultId], references: [id], onDelete: Cascade)
 
   // The claim query's covering index. Without this the queue table-scans once
   // there are a few thousand completed jobs sitting in it.
   @@index([status, createdAt])
-  @@index([runId])
+  @@index([auditId])
   @@map("jobs")
 }
