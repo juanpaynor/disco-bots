@@ -1,7 +1,10 @@
-import { chromium, type BrowserContext, type Page } from "playwright";
+import { chromium, type BrowserContext, type Page, type PageScreenshotOptions } from "playwright";
 import path from "node:path";
 import { config } from "./config.js";
 import type { Platform } from "./types.js";
+import { installManagedBrowser } from "./browser-install.js";
+
+const minimizedContexts = new WeakSet<BrowserContext>();
 
 /**
  * One persistent profile per platform. Cookies and local storage live on disk,
@@ -10,7 +13,10 @@ import type { Platform } from "./types.js";
  */
 export async function launchContext(
   platform: Platform,
-  options: { headless?: boolean; viewport?: { width: number; height: number } | null } = {}
+  options: {
+    headless?: boolean; minimized?: boolean; viewport?: { width: number; height: number } | null;
+    handleSIGINT?: boolean; handleSIGTERM?: boolean;
+  } = {}
 ): Promise<BrowserContext> {
   // --- Hosted browser path -------------------------------------------------
   // When BROWSER_CDP_URL is set we do not run a browser at all: we attach to one
@@ -31,12 +37,19 @@ export async function launchContext(
   }
 
   // --- Local browser path --------------------------------------------------
+  if (process.env.DISCO_AUTO_INSTALL_BROWSER === "1" && !config.browserChannel) {
+    await installManagedBrowser();
+  }
   const userDataDir = path.join(config.profileDir, platform);
   const proxy = config.proxyFor(platform);
   if (proxy) console.log(`[${platform}] routing via proxy ${proxy.server}`);
+  const headless = options.headless ?? config.headless;
+  const minimized = options.minimized && !headless;
 
   const context = await chromium.launchPersistentContext(userDataDir, {
-    headless: options.headless ?? config.headless,
+    headless,
+    handleSIGINT: options.handleSIGINT,
+    handleSIGTERM: options.handleSIGTERM,
     ...(config.browserChannel ? { channel: config.browserChannel } : {}),
     ...(proxy ? { proxy } : {}),
     viewport: options.viewport === undefined ? { width: 1440, height: 900 } : options.viewport,
@@ -53,6 +66,7 @@ export async function launchContext(
       "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
       "--disable-dev-shm-usage", // containers give /dev/shm 64MB; Chromium needs more
+      ...(minimized ? ["--start-minimized"] : []),
     ],
   });
 
@@ -63,7 +77,61 @@ export async function launchContext(
     'Object.defineProperty(navigator, "webdriver", { get: () => undefined });'
   });
 
+  if (minimized) {
+    minimizedContexts.add(context);
+    let warned = false;
+    const minimizePageWindow = async (page: Page): Promise<void> => {
+      if (page.isClosed()) return;
+      let session;
+      try {
+        session = await context.newCDPSession(page);
+        const { windowId, bounds } = await session.send("Browser.getWindowForTarget");
+        if (bounds.windowState !== "minimized") {
+          // Native window control also works on macOS, where the startup flag
+          // alone may be ignored. Keep page rendering and automation running.
+          await session.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
+          // The command can return before the native minimize animation ends.
+          const deadline = Date.now() + 2000;
+          while ((await session.send("Browser.getWindowBounds", { windowId })).bounds.windowState !== "minimized") {
+            if (Date.now() >= deadline) throw new Error("Window did not minimize");
+            await sleep(50);
+          }
+        }
+      } catch (error) {
+        if (!page.isClosed() && !warned) {
+          warned = true;
+          console.warn(`[${platform}] Could not minimize browser: ${error instanceof Error ? error.message : String(error)}. Use --browser headless for no windows.`);
+        }
+      } finally { await session?.detach().catch(() => {}); }
+    };
+    // Gemini and Claude create new pages for subsequent prompts. Apply the same
+    // behavior to those windows without touching the user's other Chrome sessions.
+    context.on("page", (page) => { void minimizePageWindow(page); });
+    await Promise.all(context.pages().map(minimizePageWindow));
+  }
+
   return context;
+}
+
+/** macOS stops producing screenshot frames for a minimized native window. */
+export async function captureScreenshot(page: Page, options: PageScreenshotOptions): Promise<Buffer> {
+  const context = page.context();
+  if (!minimizedContexts.has(context)) return page.screenshot(options);
+  const session = await context.newCDPSession(page);
+  let restoreWindowId: number | undefined;
+  try {
+    const { windowId, bounds } = await session.send("Browser.getWindowForTarget");
+    if (bounds.windowState === "minimized") {
+      restoreWindowId = windowId;
+      await session.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } });
+    }
+    return await page.screenshot(options);
+  } finally {
+    if (restoreWindowId !== undefined && !page.isClosed()) {
+      await session.send("Browser.setWindowBounds", { windowId: restoreWindowId, bounds: { windowState: "minimized" } }).catch(() => {});
+    }
+    await session.detach().catch(() => {});
+  }
 }
 
 export function sleep(ms: number): Promise<void> {

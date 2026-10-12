@@ -12,6 +12,8 @@ import { SURFACE_LABELS } from "./types.js";
 import { CHAT_PLATFORMS, createRun, executeRun, RunControl, type ChatPlatform, type LocalRun } from "./local-run.js";
 import { lockRun, promptsFromFile, readRun, saveRun } from "./local-store.js";
 import { choosePlatforms } from "./disco-wizard.js";
+import { ensureAccounts } from "./disco-accounts.js";
+import { installManagedBrowser } from "./browser-install.js";
 
 const help = `AiDisco — send prompts to ChatGPT, Gemini and Claude
 
@@ -19,6 +21,12 @@ const help = `AiDisco — send prompts to ChatGPT, Gemini and Claude
   disco --prompt "Your question"      One prompt, all three platforms in parallel
   disco --file prompts.csv            CSV with a Prompt/Text column, or .txt lines
   disco --platforms chatgpt,claude     Skip model picker; use these platforms
+  disco --login                      Set up or refresh selected account logins
+  disco --install-browser            Download the managed browser without logging in
+  disco --version                    Show the installed version
+  disco --browser minimized          Minimize Chrome windows (default)
+  disco --browser visible            Show browser windows for troubleshooting
+  disco --browser headless           Run without browser windows
   disco --out /path/to/run-folder     Choose the output folder
   disco --open /path/to/run-folder    Open saved results in your file manager
   disco --resume /path/to/run-folder  Continue pending work; retain saved answers
@@ -36,8 +44,8 @@ function options(args: string[]): Map<string, string> {
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
     if (out.has(flag)) throw new Error(`Duplicate option: ${flag}`);
-    if (["--help", "-h", "--retry-failed"].includes(flag)) out.set(flag, "true");
-    else if (["--prompt", "--file", "--platforms", "--out", "--resume", "--open"].includes(flag)) {
+    if (["--help", "-h", "--version", "-v", "--install-browser", "--retry-failed", "--login"].includes(flag)) out.set(flag, "true");
+    else if (["--prompt", "--file", "--platforms", "--browser", "--out", "--resume", "--open"].includes(flag)) {
       const value = args[++i];
       if (!value || value.startsWith("--")) throw new Error(`Missing value for ${flag}`);
       out.set(flag, value);
@@ -46,11 +54,20 @@ function options(args: string[]): Map<string, string> {
   if (out.has("--open") && [...out.keys()].some((k) => !["--open", "--help", "-h"].includes(k))) {
     throw new Error("Use --open on its own to open an existing output folder.");
   }
+  if (out.has("--login") && [...out.keys()].some((k) => !["--login", "--platforms", "--help", "-h"].includes(k))) {
+    throw new Error("Use --login on its own or with --platforms to set up accounts without starting a run.");
+  }
+  if (out.has("--install-browser") && [...out.keys()].some((k) => !["--install-browser", "--help", "-h"].includes(k))) {
+    throw new Error("Use --install-browser on its own to download Chromium without starting a run.");
+  }
   if (out.has("--prompt") && out.has("--file")) throw new Error("Choose either --prompt or --file.");
   if (out.has("--resume") && ["--prompt", "--file", "--platforms", "--out"].some((k) => out.has(k))) {
     throw new Error("--resume uses the prompts, platforms and folder from the saved run.");
   }
   if (out.has("--retry-failed") && !out.has("--resume")) throw new Error("--retry-failed requires --resume.");
+  if (out.has("--browser") && !["minimized", "visible", "headless"].includes(out.get("--browser")!)) {
+    throw new Error("Choose --browser minimized, visible, or headless.");
+  }
   return out;
 }
 
@@ -120,6 +137,12 @@ async function readPrompts(platforms: ChatPlatform[]): Promise<string[]> {
 async function main(): Promise<void> {
   const opts = options(process.argv.slice(2));
   if (opts.has("--help") || opts.has("-h")) { console.log(help); return; }
+  if (opts.has("--version") || opts.has("-v")) { console.log(`AiDisco ${process.env.DISCO_VERSION ?? "development"}`); return; }
+  if (opts.has("--install-browser")) {
+    await installManagedBrowser();
+    console.log("Disco's browser is ready.");
+    return;
+  }
   if (opts.has("--open")) {
     const folder = inputPath(opts.get("--open")!);
     await openOutputFolder(folder);
@@ -127,6 +150,7 @@ async function main(): Promise<void> {
     return;
   }
   showStartupArt();
+  const browserMode = opts.get("--browser") ?? "minimized";
   const interactive = !!process.stdout.isTTY && !!process.stdin.isTTY;
   const selected = opts.get("--platforms") ?? "all";
   let platforms = (selected === "all" ? [...CHAT_PLATFORMS] : selected.split(",").map((p) => p.trim())) as ChatPlatform[];
@@ -138,6 +162,13 @@ async function main(): Promise<void> {
     if (!chosen) { console.log("\nSetup cancelled."); return; }
     platforms = chosen;
   }
+  if (!opts.has("--resume")) {
+    if (!await ensureAccounts(platforms, { interactive, force: opts.has("--login") })) {
+      console.log("\nAccount setup cancelled. No prompts were submitted.");
+      return;
+    }
+    if (opts.has("--login")) return;
+  }
   let stateFile: string;
   let run: LocalRun;
   let release: (() => void) | undefined;
@@ -148,11 +179,17 @@ async function main(): Promise<void> {
       if (path.basename(stateFile) !== "run.json") throw new Error("Resume a run folder or its run.json file.");
       release = lockRun(stateFile);
       run = readRun(stateFile, opts.has("--retry-failed"));
+      const pendingPlatforms = [...new Set(run.results.filter((result) => result.status === "pending").map((result) => result.platform))];
+      if (!await ensureAccounts(pendingPlatforms, { interactive })) {
+        console.log("\nAccount setup cancelled. No prompts were submitted.");
+        return;
+      }
     } else {
       const prompts = opts.has("--prompt") ? [opts.get("--prompt")!] : opts.has("--file")
         ? promptsFromFile(inputPath(opts.get("--file")!)) : await readPrompts(platforms);
       run = createRun(prompts, platforms);
-      const folder = opts.has("--out") ? inputPath(opts.get("--out")!) : path.resolve("exports", "disco", run.id);
+      const folder = opts.has("--out") ? inputPath(opts.get("--out")!)
+        : path.resolve(process.env.DISCO_DATA_DIR ?? ".", "exports", "disco", run.id);
       stateFile = path.join(folder, "run.json");
       release = lockRun(stateFile);
       if (fs.existsSync(stateFile) || fs.existsSync(path.join(folder, "results.csv"))) {
@@ -176,7 +213,7 @@ async function main(): Promise<void> {
       const filled = Math.round(finished / run.results.length * 24);
       const width = Math.max(20, (process.stdout.columns ?? 90) - 4);
       const lines = [
-        `${cyan}AiDisco${reset} · by Johnny P  ${magenta}${control.stopped ? "Stopping after current prompt" : control.paused ? "Paused after current prompt" : "Running"}${reset}`,
+        `${cyan}AiDisco${reset} · by Johnny P  ${magenta}${control.stopped ? "Stopping after current prompt" : control.paused ? "Paused after current prompt" : "Running"}${reset} · browser: ${browserMode}`,
         "", `${cyan}${"━".repeat(filled)}${reset}${"─".repeat(24 - filled)}  ${finished}/${run.results.length} · ${done} saved · ${failed} failed · ${Math.floor((Date.now() - started) / 1000)}s`, "",
       ];
       for (const platform of CHAT_PLATFORMS) {
@@ -221,9 +258,13 @@ async function main(): Promise<void> {
         readline.emitKeypressEvents(process.stdin);
         process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on("keypress", keypress);
         refresh = setInterval(render, 250); render();
-      } else console.log(`AiDisco · ${run.id} · ${run.results.length} captures`);
+      } else console.log(`AiDisco · ${run.id} · ${run.results.length} captures · browser: ${browserMode}`);
       await executeRun(run, control, {
-        launch: (platform) => launchContext(platform, { headless: false, viewport: null }),
+        launch: (platform) => launchContext(platform, {
+          headless: browserMode === "headless",
+          minimized: browserMode === "minimized",
+          viewport: browserMode === "headless" ? { width: 1440, height: 900 } : null,
+        }),
         // The database audit adapter retains its long-answer floor. A local
         // prompt may legitimately ask for a number or a one-word answer.
         scrape: { ...bots, chatgpt: (ctx, prompt) => scrapeChatgpt(ctx, prompt, { minAnswerChars: 1 }) },

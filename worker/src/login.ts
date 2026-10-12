@@ -15,11 +15,9 @@ import readline from "node:readline/promises";
 import { config } from "./config.js";
 import { launchContext } from "./browser.js";
 import { isPlatform } from "./types.js";
+import { loginAccount } from "./disco-accounts.js";
 
 const URLS: Record<string, string> = {
-  chatgpt: "https://chatgpt.com/",
-  gemini: "https://gemini.google.com/app",
-  claude: "https://claude.ai/login",
   // Google Search needs no login, but a warmed profile (consent dialogs
   // dismissed, region settled) still behaves more like a real user.
   google: "https://www.google.com/",
@@ -32,22 +30,27 @@ if (!platform || !isPlatform(platform)) {
 }
 
 const userDataDir = path.join(config.profileDir, platform);
-console.log(`Opening ${platform}. Profile: ${userDataDir}`);
-
-// The login must use the same channel, proxy, locale and remote session as jobs.
-// Follow the real window dimensions so account controls stay on screen when
-// the user resizes the browser on a smaller display.
-const context = await launchContext(platform, { headless: false, viewport: null });
-try {
-  const page = context.pages()[0] ?? (await context.newPage());
-  await page.goto(URLS[platform]);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    await rl.question("\nSign in, disable memory/custom instructions, then press Enter here…");
-  } finally {
-    rl.close();
+if (platform !== "google") {
+  if (!await loginAccount(platform)) {
+    console.log("Account setup cancelled.");
+    process.exitCode = 1;
   }
-} finally {
-  await context.close();
+} else {
+  console.log(`Opening ${platform}. Profile: ${userDataDir}`);
+
+  // Use the same browser settings and profile as capture jobs.
+  const context = await launchContext(platform, { headless: false, viewport: null });
+  try {
+    const page = context.pages()[0] ?? (await context.newPage());
+    await page.goto(URLS[platform]);
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      await rl.question("\nDismiss any consent dialogs, then press Enter here…");
+    } finally {
+      rl.close();
+    }
+  } finally {
+    await context.close();
+  }
+  console.log(`Session saved. Run a verification before queueing ${platform} jobs.`);
 }
-console.log(`Session saved. Run a verification before queueing ${platform} jobs.`);

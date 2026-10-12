@@ -8,7 +8,9 @@
   },
   "scripts": {
     "disco": "node --import tsx src/disco.ts",
-    "test:disco": "node --import tsx --test src/local-run.test.ts src/disco-wizard.test.ts",
+    "test:disco": "node --import tsx --test src/local-run.test.ts src/disco-wizard.test.ts src/disco-accounts.test.ts src/browser-install.test.ts",
+    "package:disco": "node scripts/package-cli.mjs",
+    "test:accounts": "node --import tsx --test src/disco-accounts.test.ts src/disco-accounts-browser.test.ts",
     "test:chatgpt": "node --import tsx --test src/bots/chatgpt.test.ts",
     "generate": "prisma generate",
     "db:push": "prisma db push",
@@ -34,6 +36,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
+    "esbuild": "0.28.2",
     "prisma": "^5.22.0",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"

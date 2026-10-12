@@ -2,7 +2,7 @@ import { mkdir, writeFile, chmod } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { BrowserContext, Page } from "playwright";
-import { humanType, jitter, sleep } from "../browser.js";
+import { captureScreenshot, humanType, jitter, sleep } from "../browser.js";
 import { config } from "../config.js";
 import type { ScrapeOutput } from "../types.js";
 
@@ -148,7 +148,7 @@ export async function scrape(context: BrowserContext, prompt: string, options: C
     await mkdir(dir, { recursive: true, mode: 0o700 });
     let screenshotError: string | undefined;
     try {
-      await page.screenshot({ path: screenshotPath, fullPage: true, animations: "disabled", timeout: 10_000 });
+      await captureScreenshot(page, { path: screenshotPath, fullPage: true, animations: "disabled", timeout: 10_000 });
       await chmod(screenshotPath, 0o600);
     } catch {
       screenshotError = "Screenshot unavailable (page may have closed or crashed)";
